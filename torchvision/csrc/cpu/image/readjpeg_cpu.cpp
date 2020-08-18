@@ -94,50 +94,68 @@ static void torch_jpeg_set_source_mgr(
   src->pub.next_input_byte = src->data;
 }
 
-torch::Tensor decodeJPEG(const torch::Tensor& data) {
-  struct jpeg_decompress_struct cinfo;
-  struct torch_jpeg_error_mgr jerr;
+}
 
-  auto datap = data.data_ptr<uint8_t>();
+// This needs to happen in a separate function to avoid undefined behavior with
+// setjmp and longjmp
+static void actualDecodeJPEG(const torch::Tensor& input,
+        jpeg_decompress_struct *cinfo,
+        torch_jpeg_error_mgr *jerr,
+        torch::Tensor *output
+        )
+{
+  uint8_t *inputData = input.data_ptr<uint8_t>();
   // Setup decompression structure
-  cinfo.err = jpeg_std_error(&jerr.pub);
-  jerr.pub.error_exit = torch_jpeg_error_exit;
+  cinfo->err = jpeg_std_error(&jerr->pub);
+  jerr->pub.error_exit = torch_jpeg_error_exit;
   /* Establish the setjmp return context for my_error_exit to use. */
-  if (setjmp(jerr.setjmp_buffer)) {
+  if (setjmp(jerr->setjmp_buffer)) {
     /* If we get here, the JPEG code has signaled an error.
      * We need to clean up the JPEG object.
      */
-    jpeg_destroy_decompress(&cinfo);
+    jpeg_destroy_decompress(cinfo);
     AT_ERROR(jpegLastErrorMsg);
   }
 
-  jpeg_create_decompress(&cinfo);
-  torch_jpeg_set_source_mgr(&cinfo, datap, data.numel());
+  jpeg_create_decompress(cinfo);
+  torch_jpeg_set_source_mgr(cinfo, inputData, input.numel());
 
   // read info from header.
-  jpeg_read_header(&cinfo, TRUE);
-  jpeg_start_decompress(&cinfo);
+  jpeg_read_header(cinfo, TRUE);
+  jpeg_start_decompress(cinfo);
 
-  int height = cinfo.output_height;
-  int width = cinfo.output_width;
-  int components = cinfo.output_components;
+  const int height = cinfo->output_height;
+  const int width = cinfo->output_width;
+  const int components = cinfo->output_components;
 
-  auto stride = width * components;
-  auto tensor = torch::empty(
-      {int64_t(height), int64_t(width), int64_t(components)}, torch::kU8);
-  auto ptr = tensor.data_ptr<uint8_t>();
-  while (cinfo.output_scanline < cinfo.output_height) {
+  const int stride = width * components;
+  uint8_t *outputData = output->data_ptr<uint8_t>();
+  while (cinfo->output_scanline < cinfo->output_height) {
     /* jpeg_read_scanlines expects an array of pointers to scanlines.
      * Here the array is only one element long, but you could ask for
      * more than one scanline at a time if that's more convenient.
      */
-    jpeg_read_scanlines(&cinfo, &ptr, 1);
-    ptr += stride;
+    jpeg_read_scanlines(cinfo, &outputData, 1);
+    outputData += stride;
   }
 
-  jpeg_finish_decompress(&cinfo);
-  jpeg_destroy_decompress(&cinfo);
-  return tensor;
+  jpeg_finish_decompress(cinfo);
+  jpeg_destroy_decompress(cinfo);
+}
+
+torch::Tensor decodeJPEG(const torch::Tensor& data)
+{
+  // setjmp and longjmp leads to undefined behavior and are generally just a
+  // PITA. So to make sure we don't invoke any undefined behavior declare
+  // everything outside the actual decoding function using setjmp and longjmp.
+  // For now most compilers (to the best of my knowledge) aren't affected by
+  // this, but it might lead to memory corruption in the future.
+  jpeg_decompress_struct cinfo;
+  torch_jpeg_error_mgr jerr;
+  auto output = torch::empty(
+      {int64_t(height), int64_t(width), int64_t(components)}, torch::kU8);
+  actualDecodeJPEG(data, &cinfo, &jerr, &output);
+  return output;
 }
 
 #endif // JPEG_FOUND
